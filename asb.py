@@ -39,6 +39,222 @@ type_param = ["string", "int", "float", "bool", "vec3f", "userdefined"] # Data t
 
 # Enums and stuff
 class ASB:
+    def from_binary(self, data):
+        self.output_dict = {}
+        self.max_blackboard_index = 0
+
+        self.stream = ReadStream(data)
+        self.functions = {}
+
+        # Header (0x74 Bytes)
+        self.magic = self.stream.read(4).decode('utf-8')
+        if self.magic != "ASB ": # Must be .asb file with correct magic
+            raise Exception(f"Invalid magic {self.magic} - expected 'ASB '")
+        self.version = self.stream.read_u32()
+        if self.version not in [0x417, 0x40F]: # Must be version 0x417 or 0x40F
+            raise Exception(f"Invalid version {hex(self.version)} - expected 0x417 or 0x40F")
+        
+        self.filename_offset = self.stream.read_u32()
+        self.command_count = self.stream.read_u32()
+        self.node_count = self.stream.read_u32()
+        self.event_count = self.stream.read_u32()
+        self.slot_count = self.stream.read_u32()
+        self.x38_count = self.stream.read_u32()
+        self.local_blackboard_offset = self.stream.read_u32()
+        self.string_pool_offset = self.stream.read_u32()
+        
+        # Create string pool slice
+        jumpback = self.stream.tell()
+        self.stream.seek(self.string_pool_offset)
+        self.string_pool = ReadStream(self.stream.read())
+        self.filename = self.string_pool.read_string(self.filename_offset)
+        self.stream.seek(jumpback)
+
+        self.enum_resolve_array_offset = self.stream.read_u32()
+        self.x2c_offset = self.stream.read_u32()
+        self.event_offsets_offset = self.stream.read_u32()
+        self.slots_offset = self.stream.read_u32()
+        self.x38_offset = self.stream.read_u32()
+        self.x38_index_offset = self.stream.read_u32()
+        self.x40_offset = self.stream.read_u32()
+        self.x40_count = self.stream.read_u32()
+        self.bone_group_offset = self.stream.read_u32()
+        self.bone_group_count = self.stream.read_u32()
+        self.string_pool_size = self.stream.read_u32()
+        self.transitions_offset = self.stream.read_u32()
+        self.tag_list_offset = self.stream.read_u32()
+        self.as_markings_offset = self.stream.read_u32()
+        self.exb_offset = self.stream.read_u32()
+        self.command_groups_offset = self.stream.read_u32()
+        if self.version == 0x417:
+            self.x68_offset = self.stream.read_u32()
+
+        self.output_dict["Info"] = {
+            "Magic" : self.magic,
+            "Version" : hex(self.version),
+            "Filename" : self.filename
+        }
+
+        self.command_start = self.stream.tell()
+
+        self.stream.seek(self.local_blackboard_offset)
+
+        self.local_blackboard_params = self.LocalBlackboard()
+        self.output_dict["Local Blackboard Parameters"] = self.local_blackboard_params
+
+        if self.exb_offset:
+            self.stream.seek(self.exb_offset)
+            self.exb = EXB(self.stream.read())
+            self.output_dict["EXB Section"] = self.exb.exb_section
+        else:
+            self.exb = {}
+
+        self.stream.seek(self.x40_offset)
+        self.x40_section = []
+        for i in range(self.x40_count):
+            self.x40_section.append(self.X40())
+
+        self.stream.seek(self.command_start)
+        if self.version == 0x417:
+            assert self.stream.tell() == 0x6C, "Something went wrong, invalid header size"
+        elif self.version == 0x40F:
+            assert self.stream.tell() == 0x68, "Something went wrong, invalid header size"
+        else:
+            raise ValueError(f"Invalid version: {hex(self.version)}")
+        self.commands = []
+        for i in range(self.command_count):
+            self.commands.append(self.Command())
+        self.output_dict["Commands"] = self.commands
+        self.node_start = self.stream.tell()
+
+        self.stream.seek(self.event_offsets_offset)
+        self.events = []
+        for i in range(self.event_count):
+            self.events.append(self.Event())
+
+        self.stream.seek(self.x38_offset)
+        self.x38_section = []
+        for i in range(self.x38_count):
+            self.x38_section.append(self.X38())
+
+        self.stream.seek(self.bone_group_offset)
+        self.bone_groups = []
+        for i in range(self.bone_group_count):
+            self.bone_groups.append(self.BoneGroup())
+
+        self.command_groups = []
+        if self.command_groups_offset:
+            self.stream.seek(self.command_groups_offset)
+            for i in range(self.stream.read_u32()):
+                self.command_groups.append(self.CommandGroup())
+
+        self.stream.seek(self.transitions_offset)
+        count = self.stream.read_u32()
+        unknown = self.stream.read_u32() # usually 0? not sure if I should include it
+        self.transitions = []
+        for i in range(count):
+            self.transitions.append(self.Transition())
+        self.output_dict["Transitions"] = self.transitions
+
+        self.stream.seek(self.tag_list_offset)
+        count = self.stream.read_u32()
+        self.tag_list = []
+        for i in range(count):
+            self.tag_list.append(self.string_pool.read_string(self.stream.read_u32()))
+        self.output_dict["Valid Tag List"] = self.tag_list
+
+        self.stream.seek(self.slots_offset)
+        self.slots = []
+        for i in range(self.slot_count):
+            self.slots.append(self.Slot())
+        self.output_dict["Animation Slots"] = self.slots
+
+        self.stream.seek(self.as_markings_offset)
+        count = self.stream.read_u32()
+        self.as_markings = []
+        for i in range(count):
+            self.as_markings.append(self.ASMarking())
+
+        if self.version == 0x417:
+            self.stream.seek(self.x68_offset)
+            count = self.stream.read_u32()
+            self.x68_section = []
+            for i in range(count):
+                self.x68_section.append(self.X68())
+            self.output_dict["0x68 Section"] = self.x68_section
+
+        # Unused in 0x417, only used in 0x40F (just like AINB)
+        self.stream.seek(self.enum_resolve_array_offset)
+        count = self.stream.read_u32()
+        self.enum_resolve = {}
+        for i in range(count):
+            offset, value = self.EnumResolve()
+            self.enum_resolve[offset] = value
+
+        self.stream.seek(self.x2c_offset)
+        count = self.stream.read_u32()
+        self.x2c_section = []
+        for i in range(count):
+            self.x2c_section.append(self.X2C())
+
+        self.stream.seek(self.node_start)
+        self.nodes = {}
+        for i in range(self.node_count):
+            self.nodes[i] = self.Node()
+        self.output_dict["Nodes"] = self.nodes
+
+    def from_dict(self, data):
+        self.output_dict = data
+        self.version = int(data["Info"]["Version"], 16)
+        if self.version not in [0x417, 0x40F]:
+            raise ValueError(f"Invalid version {self.version}, expected 0x417 or 0x40F")
+        self.filename = data["Info"]["Filename"]
+        self.nodes = data["Nodes"]
+        self.x68_section = data["0x68 Section"]
+        self.slots = data["Animation Slots"]
+        self.tag_list = data["Valid Tag List"]
+        self.transitions = data["Transitions"]
+        self.commands = data["Commands"]
+        self.local_blackboard_params = data["Local Blackboard Parameters"]
+        if "EXB Section" in data:
+            self.exb = EXB(None, data["EXB Section"], from_dict=True)
+        else:
+            self.exb = {}
+        self.x40_section = []
+        self.x38_section = []
+        self.events = []
+        self.bone_groups = []
+        self.command_groups = []
+        self.as_markings = []
+        if self.version == 0x417:
+            self.x68_section = []
+        self.enum_resolve = {} # not doing this bc I don't feel like it
+        self.x2c_section = []
+        for index in self.nodes:
+            for entry in self.nodes[index]["0x40 Entries"]:
+                self.x40_section.append(entry)
+            for entry in self.nodes[index]["0x38 Entries"]:
+                if entry not in self.x38_section:
+                    self.x38_section.append(entry)
+            if self.nodes[index]["Node Type"] == "Event":
+                self.events.append(self.nodes[index]["Body"]["Event"])
+            if self.nodes[index]["Node Type"] == "BoneBlender":
+                if self.nodes[index]["Body"]["Bone Group"] not in self.bone_groups:
+                    self.bone_groups.append(self.nodes[index]["Body"]["Bone Group"])
+            if "ASMarkings" in self.nodes[index]:
+                if self.nodes[index]["ASMarkings"] not in self.as_markings:
+                    self.as_markings.append(self.nodes[index]["ASMarkings"])
+            if "Body" in self.nodes[index]:
+                if "0x2C Connections" in self.nodes[index]["Body"]:
+                    for entry in self.nodes[index]["Body"]["0x2C Connections"]:
+                        self.x2c_section.append(entry["0x2C Entry"])
+        if self.version == 0x417:
+            for transition in self.transitions:
+                for entry in transition["Transitions"]:
+                    if "Command Group" in entry:
+                        self.command_groups.append(entry["Command Group"])
+
+
     def __init__(self, data):
         from_json = False
         if type(data) == str:
